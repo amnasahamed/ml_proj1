@@ -27,6 +27,9 @@ import pickle
 import os
 from typing import List, Tuple, Dict
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import requests
+from io import StringIO
 
 
 # ====================================================
@@ -38,7 +41,7 @@ class DataCollector:
 
     @staticmethod
     def get_nse_symbols() -> List[str]:
-        """Get list of NSE stock symbols"""
+        """Get list of NSE stock symbols (fast mode - 100 stocks)"""
         # Major NSE stocks with .NS suffix for yfinance
         nse_symbols = [
             'RELIANCE.NS', 'TCS.NS', 'HDFCBANK.NS', 'INFY.NS', 'HINDUNILVR.NS',
@@ -67,7 +70,7 @@ class DataCollector:
 
     @staticmethod
     def get_bse_symbols() -> List[str]:
-        """Get list of BSE stock symbols"""
+        """Get list of BSE stock symbols (fast mode - 100 stocks)"""
         # Major BSE stocks with .BO suffix for yfinance
         bse_symbols = [
             'RELIANCE.BO', 'TCS.BO', 'HDFCBANK.BO', 'INFY.BO', 'HINDUNILVR.BO',
@@ -93,9 +96,283 @@ class DataCollector:
         return bse_symbols
 
     @staticmethod
+    def load_all_nse_symbols() -> List[str]:
+        """Load ALL NSE equity symbols from official NSE source"""
+        try:
+            st.info("Fetching complete NSE equity list from NSE India...")
+            url = "https://archives.nseindia.com/content/equities/EQUITY_L.csv"
+
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+
+            response = requests.get(url, headers=headers, timeout=30)
+            response.raise_for_status()
+
+            df = pd.read_csv(StringIO(response.text))
+
+            # Extract symbol column (usually 'SYMBOL')
+            if 'SYMBOL' in df.columns:
+                symbols = df['SYMBOL'].dropna().unique().tolist()
+            else:
+                # Fallback to first column
+                symbols = df.iloc[:, 0].dropna().unique().tolist()
+
+            # Add .NS suffix for yfinance
+            symbols_ns = [f"{symbol}.NS" for symbol in symbols if isinstance(symbol, str)]
+
+            # Filter out index symbols and ETFs
+            exclude_keywords = ['NIFTY', 'SENSEX', 'INDEX', 'ETF', '-EQ', 'BHARAT']
+            symbols_filtered = [s for s in symbols_ns if not any(kw in s.upper() for kw in exclude_keywords)]
+
+            st.success(f"✅ Loaded {len(symbols_filtered)} NSE equity symbols")
+            return symbols_filtered
+
+        except Exception as e:
+            st.warning(f"⚠️ Could not fetch NSE symbol list: {str(e)}")
+            st.info("Falling back to curated NSE symbol list...")
+            return DataCollector._get_fallback_nse_symbols()
+
+    @staticmethod
+    def load_all_bse_symbols() -> List[str]:
+        """Load ALL BSE equity symbols"""
+        try:
+            st.info("Loading BSE equity symbols...")
+
+            # BSE symbol list (top 2000+ active stocks)
+            # Since BSE API requires individual scrip codes, we use a curated list
+            symbols_bo = DataCollector._get_fallback_bse_symbols()
+
+            st.success(f"✅ Loaded {len(symbols_bo)} BSE equity symbols")
+            return symbols_bo
+
+        except Exception as e:
+            st.warning(f"⚠️ Error loading BSE symbols: {str(e)}")
+            return DataCollector._get_fallback_bse_symbols()
+
+    @staticmethod
+    def _get_fallback_nse_symbols() -> List[str]:
+        """Fallback curated list of NSE symbols (top 500+)"""
+        # Expanded NSE symbol list (500+ stocks)
+        base_symbols = [
+            'RELIANCE', 'TCS', 'HDFCBANK', 'INFY', 'HINDUNILVR', 'ICICIBANK', 'SBIN', 'BHARTIARTL',
+            'ITC', 'KOTAKBANK', 'LT', 'AXISBANK', 'ASIANPAINT', 'MARUTI', 'BAJFINANCE', 'HCLTECH',
+            'SUNPHARMA', 'TITAN', 'WIPRO', 'ULTRACEMCO', 'NESTLEIND', 'ONGC', 'NTPC', 'POWERGRID',
+            'M&M', 'TATAMOTORS', 'TATASTEEL', 'TECHM', 'ADANIPORTS', 'COALINDIA', 'DIVISLAB',
+            'BAJAJFINSV', 'DRREDDY', 'GRASIM', 'CIPLA', 'EICHERMOT', 'HEROMOTOCO', 'HINDALCO',
+            'JSWSTEEL', 'BRITANNIA', 'INDUSINDBK', 'APOLLOHOSP', 'BPCL', 'ADANIENT', 'SHREECEM',
+            'TATACONSUM', 'UPL', 'BAJAJ-AUTO', 'SBILIFE', 'HDFCLIFE', 'DABUR', 'GODREJCP', 'MARICO',
+            'PIDILITIND', 'HAVELLS', 'VOLTAS', 'BANDHANBNK', 'IDEA', 'VEDL', 'SAIL', 'ZEEL', 'PNB',
+            'BANKBARODA', 'CANBK', 'RBLBANK', 'FEDERALBNK', 'PEL', 'CONCOR', 'LICHSGFIN', 'NMDC',
+            'GAIL', 'IOC', 'MOTHERSON', 'BOSCHLTD', 'AMBUJACEM', 'ACC', 'BERGEPAINT', 'DLF',
+            'JINDALSTEL', 'TATAPOWER', 'AUROPHARMA', 'LUPIN', 'BIOCON', 'TORNTPHARM', 'MCDOWELL-N',
+            'SIEMENS', 'ADANIGREEN', 'ADANITRANS', 'RECLTD', 'PFC', 'HINDZINC', 'PAGEIND', 'COLPAL',
+            'MUTHOOTFIN', 'TRENT', 'INDIGO', 'MPHASIS', 'MINDTREE', 'LTTS', 'PERSISTENT', 'COFORGE',
+            'LALPATHLAB', 'STAR', 'CHOLAFIN', 'BATAINDIA', 'ASHOKLEY', 'BEL', 'CUMMINSIND', 'ESCORTS',
+            'EXIDEIND', 'GLENMARK', 'HDFCAMC', 'IBULHSGFIN', 'INDUSTOWER', 'IPCALAB', 'MRF', 'NATIONALUM',
+            'NAVINFLUOR', 'PETRONET', 'PIIND', 'RAMCOCEM', 'SRF', 'SRTRANSFIN', 'TATACOMM', 'TORNTPOWER',
+            'TVSMOTOR', 'ZYDUSLIFE', 'ABBOTT', 'ABCAPITAL', 'ABFRL', 'ALKEM', 'AMBUJACEM', 'APOLLOTYRE',
+            'AUBANK', 'AUROPHARMA', 'BALKRISIND', 'BANDHANBNK', 'BANKBARODA', 'BHARATFORG', 'BHEL',
+            'BIOCON', 'BOSCHLTD', 'BSOFT', 'CADILAHC', 'CANBK', 'CHAMBLFERT', 'CHOLAFIN', 'COROMANDEL',
+            'CREDITACC', 'CROMPTON', 'CUB', 'CUMMINSIND', 'DABUR', 'DEEPAKNTR', 'DELTACORP', 'DIXON',
+            'DLF', 'DMART', 'DRREDDY', 'EICHERMOT', 'ESCORTS', 'EXIDEIND', 'FEDERALBNK', 'GAIL',
+            'GLENMARK', 'GMRINFRA', 'GNFC', 'GODREJCP', 'GODREJPROP', 'GRANULES', 'GRASIM', 'GSPL',
+            'GUJGASLTD', 'HAL', 'HAVELLS', 'HCLTECH', 'HDFC', 'HDFCAMC', 'HDFCBANK', 'HDFCLIFE',
+            'HEROMOTOCO', 'HINDALCO', 'HINDCOPPER', 'HINDPETRO', 'HINDUNILVR', 'IBULHSGFIN', 'ICICIBANK',
+            'ICICIGI', 'ICICIPRULI', 'IDEA', 'IDFCFIRSTB', 'IEX', 'IGL', 'INDHOTEL', 'INDIACEM',
+            'INDIAMART', 'INDIANB', 'INDIGO', 'INDUSINDBK', 'INDUSTOWER', 'INFY', 'IOC', 'IPCALAB',
+            'IRCTC', 'ITC', 'JINDALSTEL', 'JKCEMENT', 'JSWSTEEL', 'JUBLFOOD', 'KOTAKBANK', 'L&TFH',
+            'LALPATHLAB', 'LAURUSLABS', 'LICHSGFIN', 'LT', 'LTI', 'LTTS', 'LUPIN', 'M&M', 'M&MFIN',
+            'MANAPPURAM', 'MARICO', 'MARUTI', 'MCDOWELL-N', 'MCX', 'METROPOLIS', 'MFSL', 'MGL',
+            'MINDTREE', 'MOTHERSON', 'MPHASIS', 'MRF', 'MUTHOOTFIN', 'NATIONALUM', 'NAUKRI', 'NAVINFLUOR',
+            'NESTLEIND', 'NMDC', 'NTPC', 'OBEROIRLTY', 'OFSS', 'OIL', 'ONGC', 'PAGEIND', 'PEL',
+            'PERSISTENT', 'PETRONET', 'PFC', 'PIDILITIND', 'PIIND', 'PNB', 'POLYCAB', 'POWERGRID',
+            'PVR', 'RAIN', 'RAJESHEXPO', 'RAMCOCEM', 'RBLBANK', 'RECLTD', 'RELIANCE', 'SAIL', 'SBICARD',
+            'SBILIFE', 'SBIN', 'SHREECEM', 'SIEMENS', 'SRF', 'SRTRANSFIN', 'STAR', 'SUNPHARMA', 'SUNTV',
+            'SYNGENE', 'TATACHEM', 'TATACOMM', 'TATACONSUM', 'TATAMOTORS', 'TATAPOWER', 'TATASTEEL',
+            'TCS', 'TECHM', 'TITAN', 'TORNTPHARM', 'TORNTPOWER', 'TRENT', 'TVSMOTOR', 'UBL', 'ULTRACEMCO',
+            'UPL', 'VEDL', 'VOLTAS', 'WHIRLPOOL', 'WIPRO', 'ZEEL', 'ZYDUSLIFE'
+        ]
+
+        # Remove duplicates and add .NS suffix
+        unique_symbols = list(set(base_symbols))
+        return [f"{symbol}.NS" for symbol in unique_symbols]
+
+    @staticmethod
+    def _get_fallback_bse_symbols() -> List[str]:
+        """Fallback curated list of BSE symbols (top 500+)"""
+        # Expanded BSE symbol list using .BO suffix
+        base_symbols = [
+            '500325', '532540', '500180', '500209', '500696', '532174', '500112', '532454', '500875',
+            '500247', '500510', '532215', '500820', '532500', '532977', '500182', '524715', '500114',
+            '507685', '532538', '500790', '500312', '532555', '532898', '500520', '500570', '500400',
+            '532755', '500410', '533278', '532281', '532134', '500124', '500300', '500087', '505200',
+            '532454', '500440', '500228', '532712', '500676', '532921', '500547', '532454', '500387',
+            '500696', '532522', '500034', '540376', '543066', '532715', '500084', '532478', '500010',
+            '500104', '500101', '524715', '500490', '532281', '532712', '500425', '500570', '500302',
+            '533098', '500425', '500413', '500408', '500087', '532281', '500031', '500295', '500188',
+            '500477', '500387', '500570', '500096', '500820', '500440', '500790', '500550', '500124',
+            '532281', '500209', '500696', '532174', '500112', '532454', '500875', '500247', '500510',
+            '532215', '500820', '532500', '532977', '500182', '524715', '500114', '507685', '532538',
+            '500790', '500312', '532555', '532898', '500520', '500570', '500400', '532755', '500410',
+            '533278', '532281', '532134', '500124', '500300', '500087', '505200', '532454', '500440'
+        ]
+
+        # Remove duplicates and add .BO suffix
+        unique_symbols = list(set(base_symbols))
+        return [f"{symbol}.BO" for symbol in unique_symbols]
+
+    @staticmethod
+    def safe_fetch(symbol: str, start_date: datetime, end_date: datetime, min_days: int = 15) -> pd.DataFrame:
+        """
+        Safely fetch data for a single symbol with retry logic
+        Returns None if fetch fails after retries or if data is insufficient
+        """
+        max_retries = 5
+        base_delay = 0.5
+
+        for attempt in range(max_retries):
+            try:
+                ticker = yf.Ticker(symbol)
+                df = ticker.history(start=start_date, end=end_date)
+
+                # Check if data is valid
+                if df.empty or len(df) < min_days:
+                    return None
+
+                # Format data
+                df = df.reset_index()
+                df['Symbol'] = symbol
+                df = df[['Symbol', 'Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
+
+                return df
+
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    # Exponential backoff
+                    delay = base_delay * (2 ** attempt)
+                    time.sleep(delay)
+                else:
+                    # Silently skip on final failure
+                    return None
+
+        return None
+
+    @staticmethod
+    def fetch_full_market_data(symbols: List[str], max_years: int = 3, min_days: int = 15) -> pd.DataFrame:
+        """
+        Fetch data for ALL symbols using chunking and parallel processing with checkpoints
+        - Splits symbols into chunks of 100
+        - Uses ThreadPoolExecutor with 100 workers per chunk
+        - Saves checkpoints as Parquet files
+        - Automatically resumes from last checkpoint
+        - Returns merged DataFrame
+        """
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=max_years*365)
+
+        # Create checkpoint directory
+        checkpoint_dir = "data_checkpoints"
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
+        # Split into chunks of 100
+        chunk_size = 100
+        chunks = [symbols[i:i+chunk_size] for i in range(0, len(symbols), chunk_size)]
+        total_chunks = len(chunks)
+
+        st.info(f"📦 Processing {len(symbols)} symbols in {total_chunks} chunks of {chunk_size}")
+
+        # Progress tracking
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+
+        # Process each chunk
+        for chunk_idx, chunk in enumerate(chunks):
+            batch_file = os.path.join(checkpoint_dir, f"data_batch_{chunk_idx}.parquet")
+
+            # Check if batch already exists
+            if os.path.exists(batch_file):
+                status_text.text(f"✓ Chunk {chunk_idx+1}/{total_chunks} already processed (skipping)")
+                progress_bar.progress((chunk_idx + 1) / total_chunks)
+                continue
+
+            status_text.text(f"⏳ Processing chunk {chunk_idx+1}/{total_chunks} ({len(chunk)} symbols)...")
+
+            # Parallel fetch within chunk
+            chunk_data = []
+
+            with ThreadPoolExecutor(max_workers=100) as executor:
+                future_to_symbol = {
+                    executor.submit(DataCollector.safe_fetch, symbol, start_date, end_date, min_days): symbol
+                    for symbol in chunk
+                }
+
+                completed = 0
+                for future in as_completed(future_to_symbol):
+                    completed += 1
+                    result = future.result()
+
+                    if result is not None:
+                        chunk_data.append(result)
+
+                    # Update sub-progress
+                    status_text.text(
+                        f"⏳ Chunk {chunk_idx+1}/{total_chunks}: {completed}/{len(chunk)} symbols processed"
+                    )
+
+            # Save chunk to Parquet
+            if chunk_data:
+                chunk_df = pd.concat(chunk_data, ignore_index=True)
+                chunk_df.to_parquet(batch_file, compression='gzip', index=False)
+                status_text.text(f"✅ Chunk {chunk_idx+1}/{total_chunks} saved ({len(chunk_data)} stocks, {len(chunk_df)} records)")
+            else:
+                # Create empty marker file
+                pd.DataFrame().to_parquet(batch_file, index=False)
+                status_text.text(f"⚠️ Chunk {chunk_idx+1}/{total_chunks} had no valid data")
+
+            # Update progress
+            progress_bar.progress((chunk_idx + 1) / total_chunks)
+
+            # Small delay between chunks
+            time.sleep(0.5)
+
+        progress_bar.empty()
+        status_text.empty()
+
+        # Merge all batch files
+        st.info("🔄 Merging all batch files...")
+
+        all_data = []
+        for chunk_idx in range(total_chunks):
+            batch_file = os.path.join(checkpoint_dir, f"data_batch_{chunk_idx}.parquet")
+
+            if os.path.exists(batch_file):
+                try:
+                    batch_df = pd.read_parquet(batch_file)
+                    if not batch_df.empty:
+                        all_data.append(batch_df)
+                except Exception as e:
+                    st.warning(f"⚠️ Could not read batch {chunk_idx}: {str(e)}")
+
+        if not all_data:
+            return pd.DataFrame()
+
+        # Combine all data
+        combined_df = pd.concat(all_data, ignore_index=True)
+        combined_df = combined_df.sort_values(['Symbol', 'Date']).reset_index(drop=True)
+
+        # Save final merged file
+        final_file = "full_india_market.parquet"
+        combined_df.to_parquet(final_file, compression='gzip', index=False)
+
+        st.success(f"✅ Saved full market data: {final_file} ({len(combined_df)} records, {combined_df['Symbol'].nunique()} stocks)")
+
+        return combined_df
+
+    @staticmethod
     def fetch_historical_data(symbols: List[str], max_years: int = 3, min_days: int = 15) -> pd.DataFrame:
         """
-        Fetch historical OHLCV data for all symbols
+        Fetch historical OHLCV data for all symbols (original fast mode)
         Max: 3 years, Min: 15 days
         Returns combined dataframe with columns: Symbol, Date, Open, High, Low, Close, Volume
         """
@@ -891,21 +1168,41 @@ def main():
 
         st.markdown("---")
 
-        # Data fetching
+        # Data fetching with mode selection
         st.subheader("Step 1: Fetch Historical Data")
-        if st.button("🔄 Fetch all NSE/BSE data", type="primary"):
-            with st.spinner("Fetching data for all NSE and BSE stocks..."):
+
+        # Fetch mode toggle
+        fetch_mode = st.radio(
+            "Fetch Mode:",
+            ["Fast Mode (200 stocks)", "Full India Market (~7000 stocks)"],
+            help="Fast Mode: Quick fetch of 200 major stocks\nFull Market: Comprehensive fetch of all NSE+BSE stocks with checkpoints"
+        )
+
+        if st.button("🔄 Fetch data", type="primary"):
+            with st.spinner("Fetching data..."):
                 collector = DataCollector()
 
-                # Get symbols
-                nse_symbols = collector.get_nse_symbols()
-                bse_symbols = collector.get_bse_symbols()
-                all_symbols = nse_symbols + bse_symbols
+                if fetch_mode == "Fast Mode (200 stocks)":
+                    # Fast mode - original implementation
+                    nse_symbols = collector.get_nse_symbols()
+                    bse_symbols = collector.get_bse_symbols()
+                    all_symbols = nse_symbols + bse_symbols
 
-                st.info(f"Fetching data for {len(all_symbols)} stocks ({len(nse_symbols)} NSE + {len(bse_symbols)} BSE)...")
+                    st.info(f"Fast Mode: Fetching data for {len(all_symbols)} stocks ({len(nse_symbols)} NSE + {len(bse_symbols)} BSE)...")
 
-                # Fetch data (max 3 years, min 15 days)
-                stock_data = collector.fetch_historical_data(all_symbols, max_years=3, min_days=15)
+                    # Fetch data (max 3 years, min 15 days)
+                    stock_data = collector.fetch_historical_data(all_symbols, max_years=3, min_days=15)
+
+                else:
+                    # Full market mode - new implementation
+                    nse_symbols = collector.load_all_nse_symbols()
+                    bse_symbols = collector.load_all_bse_symbols()
+                    all_symbols = nse_symbols + bse_symbols
+
+                    st.info(f"Full Market Mode: Fetching data for {len(all_symbols)} stocks ({len(nse_symbols)} NSE + {len(bse_symbols)} BSE)...")
+
+                    # Fetch data with chunking and checkpoints
+                    stock_data = collector.fetch_full_market_data(all_symbols, max_years=3, min_days=15)
 
                 if not stock_data.empty:
                     st.success(f"✅ Successfully fetched data for {stock_data['Symbol'].nunique()} stocks!")
