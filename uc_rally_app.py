@@ -292,6 +292,11 @@ class FeatureEngineer:
         - Volatility (ATR 14)
         - Gap-up percent
         - Compression ratio (High-Low)/Close
+        - RSI (14 period)
+        - MACD (12/26/9)
+        - OBV (On-Balance Volume)
+        - Bollinger Bands (20 period, 2 std)
+        - Support/Resistance levels (20 period)
         """
         df = df.copy()
 
@@ -355,6 +360,51 @@ class FeatureEngineer:
             # Compression ratio
             symbol_df['compression_ratio'] = (symbol_df['High'] - symbol_df['Low']) / (symbol_df['Close'] + 1e-10)
 
+            # ====================================================
+            # NEW TECHNICAL INDICATORS
+            # ====================================================
+
+            # 1. RSI (14 period)
+            delta = symbol_df['Close'].diff()
+            gain = delta.where(delta > 0, 0)
+            loss = -delta.where(delta < 0, 0)
+            avg_gain = gain.rolling(window=14, min_periods=14).mean()
+            avg_loss = loss.rolling(window=14, min_periods=14).mean()
+            rs = avg_gain / (avg_loss + 1e-10)
+            symbol_df['rsi_14'] = 100 - (100 / (1 + rs))
+
+            # 2. MACD (12/26/9)
+            ema_12 = symbol_df['Close'].ewm(span=12, adjust=False).mean()
+            ema_26 = symbol_df['Close'].ewm(span=26, adjust=False).mean()
+            symbol_df['macd_line'] = ema_12 - ema_26
+            symbol_df['signal_line'] = symbol_df['macd_line'].ewm(span=9, adjust=False).mean()
+            symbol_df['macd_histogram'] = symbol_df['macd_line'] - symbol_df['signal_line']
+
+            # 3. OBV (On-Balance Volume)
+            obv = np.zeros(len(symbol_df))
+            obv[0] = symbol_df['Volume'].iloc[0]
+            for i in range(1, len(symbol_df)):
+                if symbol_df['Close'].iloc[i] > symbol_df['Close'].iloc[i-1]:
+                    obv[i] = obv[i-1] + symbol_df['Volume'].iloc[i]
+                elif symbol_df['Close'].iloc[i] < symbol_df['Close'].iloc[i-1]:
+                    obv[i] = obv[i-1] - symbol_df['Volume'].iloc[i]
+                else:
+                    obv[i] = obv[i-1]
+            symbol_df['obv'] = obv
+
+            # 4. Bollinger Bands (20 period, 2 std)
+            bb_ma = symbol_df['Close'].rolling(window=20).mean()
+            bb_std = symbol_df['Close'].rolling(window=20).std()
+            symbol_df['bb_upper'] = bb_ma + (2 * bb_std)
+            symbol_df['bb_lower'] = bb_ma - (2 * bb_std)
+            symbol_df['bb_width'] = (symbol_df['bb_upper'] - symbol_df['bb_lower']) / (symbol_df['Close'] + 1e-10)
+
+            # 5. Support/Resistance levels (20 period)
+            symbol_df['support_20'] = symbol_df['Low'].rolling(window=20).min()
+            symbol_df['resistance_20'] = symbol_df['High'].rolling(window=20).max()
+            symbol_df['distance_from_resistance'] = symbol_df['Close'] / (symbol_df['resistance_20'] + 1e-10)
+            symbol_df['distance_from_support'] = symbol_df['Close'] / (symbol_df['support_20'] + 1e-10)
+
             # Update main dataframe
             df.loc[mask, symbol_df.columns] = symbol_df.values
 
@@ -389,7 +439,10 @@ class ModelTrainer:
             'slope_MA10_MA20', 'slope_MA5_MA20',
             'dist_from_5d_high', 'dist_from_20d_high',
             'consecutive_up_days', 'body_wick_ratio', 'delivery_ratio',
-            'ATR_14', 'gap_up_pct', 'compression_ratio'
+            'ATR_14', 'gap_up_pct', 'compression_ratio',
+            'rsi_14', 'macd_line', 'signal_line', 'macd_histogram',
+            'obv', 'bb_upper', 'bb_lower', 'bb_width',
+            'support_20', 'resistance_20', 'distance_from_resistance', 'distance_from_support'
         ]
 
         # Remove rows with NaN in features or labels
