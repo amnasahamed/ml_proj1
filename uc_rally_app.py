@@ -160,25 +160,14 @@ class CircuitDetector:
     """Detects Upper Circuit and Lower Circuit days"""
 
     @staticmethod
-    def detect_circuits(df: pd.DataFrame,
-                       uc_min_gain: float = 2.0,
-                       lc_min_loss: float = 2.0,
-                       price_tolerance: float = 0.5) -> pd.DataFrame:
+    def detect_circuits(df: pd.DataFrame) -> pd.DataFrame:
         """
-        Detect UC and LC days
+        Detect UC and LC days using strict 1% tolerance formulas.
 
-        UC Day:
-        - Close price is near High (within tolerance %)
-        - Gain from previous close >= uc_min_gain %
+        UC Day: (High - Close) / Close <= 0.01
+        LC Day: (Close - Low) / Close <= 0.01
 
-        LC Day:
-        - Close price is near Low (within tolerance %)
-        - Loss from previous close >= lc_min_loss %
-
-        Args:
-            uc_min_gain: Minimum gain % to consider UC (default 2%)
-            lc_min_loss: Minimum loss % to consider LC (default 2%)
-            price_tolerance: How close Close should be to High/Low in % (default 0.5%)
+        These are the ONLY conditions used - no gain/loss requirements.
         """
         df = df.copy()
 
@@ -187,29 +176,25 @@ class CircuitDetector:
             mask = df['Symbol'] == symbol
             symbol_df = df[mask].copy().sort_values('Date')
 
-            # Calculate previous close
+            # Calculate previous close for gain/loss tracking (used for features, not UC/LC detection)
             symbol_df['prev_close'] = symbol_df['Close'].shift(1)
-
-            # Calculate gain/loss from previous close
             symbol_df['close_gain_pct'] = ((symbol_df['Close'] - symbol_df['prev_close']) /
                                           symbol_df['prev_close'] * 100)
 
-            # Calculate distance from High and Low
+            # Calculate distance from High and Low (as percentages for reference)
             symbol_df['dist_from_high_pct'] = ((symbol_df['High'] - symbol_df['Close']) /
                                                symbol_df['Close'] * 100)
             symbol_df['dist_from_low_pct'] = ((symbol_df['Close'] - symbol_df['Low']) /
                                               symbol_df['Close'] * 100)
 
-            # Detect UC: Close near High AND significant gain
+            # Detect UC: (High - Close) / Close <= 0.01
             symbol_df['is_uc'] = (
-                (symbol_df['dist_from_high_pct'] <= price_tolerance) &
-                (symbol_df['close_gain_pct'] >= uc_min_gain)
+                (symbol_df['High'] - symbol_df['Close']) / symbol_df['Close'] <= 0.01
             ).astype(int)
 
-            # Detect LC: Close near Low AND significant loss
+            # Detect LC: (Close - Low) / Close <= 0.01
             symbol_df['is_lc'] = (
-                (symbol_df['dist_from_low_pct'] <= price_tolerance) &
-                (symbol_df['close_gain_pct'] <= -lc_min_loss)
+                (symbol_df['Close'] - symbol_df['Low']) / symbol_df['Close'] <= 0.01
             ).astype(int)
 
             # For UC days, calculate days until next LC
@@ -845,19 +830,11 @@ def main():
     if page == "Data Fetch & Training":
         st.header("📊 Data Collection & Model Training")
 
-        # Circuit detection settings
-        st.subheader("Circuit Detection Settings")
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            uc_min_gain = st.number_input("Min UC Gain %", value=2.0, min_value=0.5, max_value=20.0, step=0.5)
-        with col2:
-            lc_min_loss = st.number_input("Min LC Loss %", value=2.0, min_value=0.5, max_value=20.0, step=0.5)
-        with col3:
-            price_tolerance = st.number_input("Price Tolerance %", value=0.5, min_value=0.1, max_value=2.0, step=0.1)
-
-        st.info(f"📌 UC Detection: Close within {price_tolerance}% of High AND gain >= {uc_min_gain}%")
-        st.info(f"📌 LC Detection: Close within {price_tolerance}% of Low AND loss >= {lc_min_loss}%")
-        st.info(f"📌 Data Range: Maximum 3 years, Minimum 15 days")
+        # Circuit detection info (fixed formulas, not user-configurable)
+        st.subheader("Circuit Detection Rules")
+        st.info("📌 UC Detection: Close nearly equals High → (High - Close) / Close ≤ 1%")
+        st.info("📌 LC Detection: Close nearly equals Low → (Close - Low) / Close ≤ 1%")
+        st.info("📌 Data Range: Maximum 3 years, Minimum 15 days")
 
         st.markdown("---")
 
@@ -884,7 +861,7 @@ def main():
                     # Detect circuits
                     st.info("Detecting UC and LC days...")
                     circuit_detector = CircuitDetector()
-                    stock_data = circuit_detector.detect_circuits(stock_data, uc_min_gain, lc_min_loss, price_tolerance)
+                    stock_data = circuit_detector.detect_circuits(stock_data)
 
                     # Generate labels
                     st.info("Generating prediction labels...")
