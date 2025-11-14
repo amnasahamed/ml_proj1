@@ -1,6 +1,6 @@
 """
 UC Rally Detector - Complete Machine Learning System
-Detects conditions that lead to Upper-Circuit rallies in Indian stocks (NSE/BSE)
+Strategy: Buy stocks at Upper Circuit (UC), hold until Lower Circuit (LC)
 """
 
 import streamlit as st
@@ -13,7 +13,7 @@ warnings.filterwarnings('ignore')
 
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix, mean_absolute_error
 import xgboost as xgb
 
 # Try to import LightGBM
@@ -22,7 +22,6 @@ try:
     LIGHTGBM_AVAILABLE = True
 except ImportError:
     LIGHTGBM_AVAILABLE = False
-    st.warning("LightGBM not installed. Only XGBoost and RandomForest will be used.")
 
 import pickle
 import os
@@ -94,13 +93,14 @@ class DataCollector:
         return bse_symbols
 
     @staticmethod
-    def fetch_historical_data(symbols: List[str], years: int = 3) -> pd.DataFrame:
+    def fetch_historical_data(symbols: List[str], max_years: int = 3, min_days: int = 15) -> pd.DataFrame:
         """
         Fetch historical OHLCV data for all symbols
+        Max: 3 years, Min: 15 days
         Returns combined dataframe with columns: Symbol, Date, Open, High, Low, Close, Volume
         """
         end_date = datetime.now()
-        start_date = end_date - timedelta(days=years*365)
+        start_date = end_date - timedelta(days=max_years*365)
 
         all_data = []
         total_symbols = len(symbols)
@@ -116,7 +116,8 @@ class DataCollector:
                 ticker = yf.Ticker(symbol)
                 df = ticker.history(start=start_date, end=end_date)
 
-                if df.empty or len(df) < 100:  # Skip if insufficient data
+                # Accept stocks with minimum 15 days of data
+                if df.empty or len(df) < min_days:
                     continue
 
                 # Reset index to get Date as column
@@ -152,55 +153,124 @@ class DataCollector:
 
 
 # ====================================================
-# 2. LABEL GENERATION MODULE
+# 2. UC/LC DETECTION MODULE
 # ====================================================
 
-class LabelGenerator:
-    """Generates UC rally labels for each day"""
+class CircuitDetector:
+    """Detects Upper Circuit and Lower Circuit days"""
 
     @staticmethod
-    def generate_labels(df: pd.DataFrame, uc_percent_nse: float = 10.0,
-                       uc_percent_bse: float = 5.0) -> pd.DataFrame:
+    def detect_circuits(df: pd.DataFrame,
+                       uc_min_gain: float = 2.0,
+                       lc_min_loss: float = 2.0,
+                       price_tolerance: float = 0.5) -> pd.DataFrame:
         """
-        Label every day with uc_rally = 1 if next 2 days contain High >= upper_circuit_price
+        Detect UC and LC days
 
-        UC Rally = price hits upper circuit for 2 or more consecutive days
+        UC Day:
+        - Close price is near High (within tolerance %)
+        - Gain from previous close >= uc_min_gain %
+
+        LC Day:
+        - Close price is near Low (within tolerance %)
+        - Loss from previous close >= lc_min_loss %
+
+        Args:
+            uc_min_gain: Minimum gain % to consider UC (default 2%)
+            lc_min_loss: Minimum loss % to consider LC (default 2%)
+            price_tolerance: How close Close should be to High/Low in % (default 0.5%)
         """
         df = df.copy()
-        df['uc_rally'] = 0
 
-        # Determine exchange based on symbol suffix
-        df['exchange'] = df['Symbol'].apply(lambda x: 'NSE' if x.endswith('.NS') else 'BSE')
-
-        # Calculate upper circuit price based on exchange
-        df['uc_percent'] = df['exchange'].apply(
-            lambda x: uc_percent_nse if x == 'NSE' else uc_percent_bse
-        )
-
-        # Group by symbol for rolling calculations
+        # Group by symbol for calculations
         for symbol in df['Symbol'].unique():
             mask = df['Symbol'] == symbol
-            symbol_df = df[mask].copy()
+            symbol_df = df[mask].copy().sort_values('Date')
 
-            # Calculate upper circuit price (based on previous close)
+            # Calculate previous close
             symbol_df['prev_close'] = symbol_df['Close'].shift(1)
-            symbol_df['upper_circuit_price'] = symbol_df['prev_close'] * (1 + symbol_df['uc_percent'] / 100)
 
-            # Check if next 2 days hit upper circuit
-            symbol_df['hit_uc_day1'] = (symbol_df['High'].shift(-1) >= symbol_df['upper_circuit_price'].shift(-1)).astype(int)
-            symbol_df['hit_uc_day2'] = (symbol_df['High'].shift(-2) >= symbol_df['upper_circuit_price'].shift(-2)).astype(int)
+            # Calculate gain/loss from previous close
+            symbol_df['close_gain_pct'] = ((symbol_df['Close'] - symbol_df['prev_close']) /
+                                          symbol_df['prev_close'] * 100)
 
-            # UC rally = both next 2 days hit upper circuit
-            symbol_df['uc_rally'] = ((symbol_df['hit_uc_day1'] == 1) & (symbol_df['hit_uc_day2'] == 1)).astype(int)
+            # Calculate distance from High and Low
+            symbol_df['dist_from_high_pct'] = ((symbol_df['High'] - symbol_df['Close']) /
+                                               symbol_df['Close'] * 100)
+            symbol_df['dist_from_low_pct'] = ((symbol_df['Close'] - symbol_df['Low']) /
+                                              symbol_df['Close'] * 100)
+
+            # Detect UC: Close near High AND significant gain
+            symbol_df['is_uc'] = (
+                (symbol_df['dist_from_high_pct'] <= price_tolerance) &
+                (symbol_df['close_gain_pct'] >= uc_min_gain)
+            ).astype(int)
+
+            # Detect LC: Close near Low AND significant loss
+            symbol_df['is_lc'] = (
+                (symbol_df['dist_from_low_pct'] <= price_tolerance) &
+                (symbol_df['close_gain_pct'] <= -lc_min_loss)
+            ).astype(int)
+
+            # For UC days, calculate days until next LC
+            symbol_df['days_to_lc'] = np.nan
+
+            uc_indices = symbol_df[symbol_df['is_uc'] == 1].index.tolist()
+            for uc_idx in uc_indices:
+                # Find next LC after this UC
+                future_df = symbol_df.loc[uc_idx:].iloc[1:]  # Skip current day
+                lc_days = future_df[future_df['is_lc'] == 1]
+
+                if not lc_days.empty:
+                    first_lc_idx = lc_days.index[0]
+                    days_diff = (symbol_df.loc[first_lc_idx, 'Date'] -
+                               symbol_df.loc[uc_idx, 'Date']).days
+                    symbol_df.loc[uc_idx, 'days_to_lc'] = days_diff
 
             # Update main dataframe
-            df.loc[mask, 'uc_rally'] = symbol_df['uc_rally'].values
+            df.loc[mask, symbol_df.columns] = symbol_df.values
 
         return df
 
 
 # ====================================================
-# 3. FEATURE ENGINEERING MODULE
+# 3. LABEL GENERATION MODULE
+# ====================================================
+
+class LabelGenerator:
+    """Generates labels for ML models"""
+
+    @staticmethod
+    def generate_uc_prediction_labels(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Generate labels to predict: Will stock hit UC tomorrow?
+        Label = 1 if next day is UC, else 0
+        """
+        df = df.copy()
+
+        for symbol in df['Symbol'].unique():
+            mask = df['Symbol'] == symbol
+            symbol_df = df[mask].copy().sort_values('Date')
+
+            # Shift is_uc by -1 to get tomorrow's UC status
+            symbol_df['will_hit_uc_tomorrow'] = symbol_df['is_uc'].shift(-1).fillna(0).astype(int)
+
+            df.loc[mask, 'will_hit_uc_tomorrow'] = symbol_df['will_hit_uc_tomorrow'].values
+
+        return df
+
+    @staticmethod
+    def generate_uc_to_lc_labels(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        For stocks at UC, generate labels for days until LC
+        This is for regression model
+        """
+        # Already computed in CircuitDetector.detect_circuits as 'days_to_lc'
+        return df
+
+
+# ====================================================
+# 4. FEATURE ENGINEERING MODULE
 # ====================================================
 
 class FeatureEngineer:
@@ -209,7 +279,7 @@ class FeatureEngineer:
     @staticmethod
     def compute_features(df: pd.DataFrame) -> pd.DataFrame:
         """
-        Compute ONLY the specified features:
+        Compute features for UC prediction:
         - 1-day, 3-day, 5-day, 10-day returns
         - Volume ratio (Volume / avg 20-day volume)
         - MA5, MA10, MA20, MA50
@@ -231,14 +301,14 @@ class FeatureEngineer:
             symbol_df = df[mask].copy().sort_values('Date')
 
             # Returns
-            symbol_df['return_1d'] = symbol_df['Close'].pct_change(1)
-            symbol_df['return_3d'] = symbol_df['Close'].pct_change(3)
-            symbol_df['return_5d'] = symbol_df['Close'].pct_change(5)
-            symbol_df['return_10d'] = symbol_df['Close'].pct_change(10)
+            symbol_df['return_1d'] = symbol_df['Close'].pct_change(1) * 100
+            symbol_df['return_3d'] = symbol_df['Close'].pct_change(3) * 100
+            symbol_df['return_5d'] = symbol_df['Close'].pct_change(5) * 100
+            symbol_df['return_10d'] = symbol_df['Close'].pct_change(10) * 100
 
             # Volume ratio
             symbol_df['avg_volume_20d'] = symbol_df['Volume'].rolling(20).mean()
-            symbol_df['volume_ratio'] = symbol_df['Volume'] / symbol_df['avg_volume_20d']
+            symbol_df['volume_ratio'] = symbol_df['Volume'] / (symbol_df['avg_volume_20d'] + 1)
 
             # Moving averages
             symbol_df['MA5'] = symbol_df['Close'].rolling(5).mean()
@@ -253,8 +323,8 @@ class FeatureEngineer:
             # Distance from highs
             symbol_df['high_5d'] = symbol_df['High'].rolling(5).max()
             symbol_df['high_20d'] = symbol_df['High'].rolling(20).max()
-            symbol_df['dist_from_5d_high'] = (symbol_df['Close'] - symbol_df['high_5d']) / symbol_df['high_5d']
-            symbol_df['dist_from_20d_high'] = (symbol_df['Close'] - symbol_df['high_20d']) / symbol_df['high_20d']
+            symbol_df['dist_from_5d_high'] = (symbol_df['Close'] - symbol_df['high_5d']) / symbol_df['high_5d'] * 100
+            symbol_df['dist_from_20d_high'] = (symbol_df['Close'] - symbol_df['high_20d']) / symbol_df['high_20d'] * 100
 
             # Consecutive up days
             symbol_df['up_day'] = (symbol_df['Close'] > symbol_df['Close'].shift(1)).astype(int)
@@ -280,10 +350,10 @@ class FeatureEngineer:
 
             # Gap-up percent
             symbol_df['gap_up_pct'] = ((symbol_df['Open'] - symbol_df['Close'].shift(1)) /
-                                       symbol_df['Close'].shift(1))
+                                       (symbol_df['Close'].shift(1) + 1e-10) * 100)
 
             # Compression ratio
-            symbol_df['compression_ratio'] = (symbol_df['High'] - symbol_df['Low']) / symbol_df['Close']
+            symbol_df['compression_ratio'] = (symbol_df['High'] - symbol_df['Low']) / (symbol_df['Close'] + 1e-10)
 
             # Update main dataframe
             df.loc[mask, symbol_df.columns] = symbol_df.values
@@ -292,23 +362,27 @@ class FeatureEngineer:
 
 
 # ====================================================
-# 4. MODEL TRAINING MODULE
+# 5. MODEL TRAINING MODULE
 # ====================================================
 
 class ModelTrainer:
     """Trains and evaluates ML models"""
 
     def __init__(self):
-        self.models = {}
-        self.best_model = None
-        self.best_model_name = None
+        self.classification_models = {}
+        self.regression_models = {}
+        self.best_classifier = None
+        self.best_classifier_name = None
+        self.best_regressor = None
+        self.best_regressor_name = None
         self.feature_columns = None
-        self.metrics = {}
+        self.classification_metrics = {}
+        self.regression_metrics = {}
         self.feature_importance = None
 
-    def prepare_data(self, df: pd.DataFrame) -> Tuple:
-        """Prepare features and labels for training"""
-        # Feature columns (exact list from feature engineering)
+    def prepare_classification_data(self, df: pd.DataFrame) -> Tuple:
+        """Prepare features and labels for UC prediction (classification)"""
+        # Feature columns
         self.feature_columns = [
             'return_1d', 'return_3d', 'return_5d', 'return_10d',
             'volume_ratio', 'MA5', 'MA10', 'MA20', 'MA50',
@@ -319,18 +393,36 @@ class ModelTrainer:
         ]
 
         # Remove rows with NaN in features or labels
-        df_clean = df[self.feature_columns + ['uc_rally']].dropna()
+        df_clean = df[self.feature_columns + ['will_hit_uc_tomorrow']].dropna()
 
         X = df_clean[self.feature_columns]
-        y = df_clean['uc_rally']
+        y = df_clean['will_hit_uc_tomorrow']
 
         return train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
 
-    def train_models(self, X_train, X_test, y_train, y_test):
-        """Train all three models"""
+    def prepare_regression_data(self, df: pd.DataFrame) -> Tuple:
+        """Prepare features and labels for UC to LC days prediction (regression)"""
+        # Only use rows where stock hit UC and we know days_to_lc
+        df_uc = df[(df['is_uc'] == 1) & (df['days_to_lc'].notna())].copy()
+
+        if df_uc.empty:
+            return None, None, None, None
+
+        df_clean = df_uc[self.feature_columns + ['days_to_lc']].dropna()
+
+        if len(df_clean) < 10:
+            return None, None, None, None
+
+        X = df_clean[self.feature_columns]
+        y = df_clean['days_to_lc']
+
+        return train_test_split(X, y, test_size=0.2, random_state=42)
+
+    def train_classification_models(self, X_train, X_test, y_train, y_test):
+        """Train models to predict UC tomorrow"""
 
         # 1. XGBoost
-        st.write("Training XGBoost...")
+        st.write("Training XGBoost Classifier...")
         xgb_model = xgb.XGBClassifier(
             n_estimators=300,
             max_depth=6,
@@ -339,10 +431,10 @@ class ModelTrainer:
             eval_metric='logloss'
         )
         xgb_model.fit(X_train, y_train)
-        self.models['XGBoost'] = xgb_model
+        self.classification_models['XGBoost'] = xgb_model
 
         # 2. Random Forest
-        st.write("Training RandomForest...")
+        st.write("Training RandomForest Classifier...")
         rf_model = RandomForestClassifier(
             n_estimators=300,
             max_depth=None,
@@ -350,27 +442,30 @@ class ModelTrainer:
             n_jobs=-1
         )
         rf_model.fit(X_train, y_train)
-        self.models['RandomForest'] = rf_model
+        self.classification_models['RandomForest'] = rf_model
 
         # 3. LightGBM (if available)
         if LIGHTGBM_AVAILABLE:
-            st.write("Training LightGBM...")
+            st.write("Training LightGBM Classifier...")
             lgb_model = lgb.LGBMClassifier(
                 num_leaves=31,
                 learning_rate=0.05,
                 n_estimators=300,
-                random_state=42
+                random_state=42,
+                verbose=-1
             )
             lgb_model.fit(X_train, y_train)
-            self.models['LightGBM'] = lgb_model
+            self.classification_models['LightGBM'] = lgb_model
 
         # Evaluate all models
-        st.write("\nEvaluating models...")
-        for name, model in self.models.items():
+        st.write("\nEvaluating classification models...")
+        best_roc_auc = 0
+
+        for name, model in self.classification_models.items():
             y_pred = model.predict(X_test)
             y_pred_proba = model.predict_proba(X_test)[:, 1]
 
-            self.metrics[name] = {
+            self.classification_metrics[name] = {
                 'accuracy': accuracy_score(y_test, y_pred),
                 'precision': precision_score(y_test, y_pred, zero_division=0),
                 'recall': recall_score(y_test, y_pred, zero_division=0),
@@ -379,26 +474,82 @@ class ModelTrainer:
                 'confusion_matrix': confusion_matrix(y_test, y_pred)
             }
 
-        # Select best model based on ROC-AUC
-        best_roc_auc = 0
-        for name, metrics in self.metrics.items():
-            if metrics['roc_auc'] > best_roc_auc:
-                best_roc_auc = metrics['roc_auc']
-                self.best_model_name = name
-                self.best_model = self.models[name]
+            if self.classification_metrics[name]['roc_auc'] > best_roc_auc:
+                best_roc_auc = self.classification_metrics[name]['roc_auc']
+                self.best_classifier_name = name
+                self.best_classifier = model
 
         # Extract feature importance from best model
-        if hasattr(self.best_model, 'feature_importances_'):
-            importance = self.best_model.feature_importances_
+        if hasattr(self.best_classifier, 'feature_importances_'):
+            importance = self.best_classifier.feature_importances_
             self.feature_importance = pd.DataFrame({
                 'feature': self.feature_columns,
                 'importance': importance
             }).sort_values('importance', ascending=False)
 
-    def get_metrics_summary(self) -> pd.DataFrame:
-        """Return metrics summary as dataframe"""
+    def train_regression_models(self, X_train, X_test, y_train, y_test):
+        """Train models to predict days from UC to LC"""
+
+        # 1. XGBoost Regressor
+        st.write("Training XGBoost Regressor...")
+        xgb_reg = xgb.XGBRegressor(
+            n_estimators=300,
+            max_depth=6,
+            learning_rate=0.05,
+            random_state=42
+        )
+        xgb_reg.fit(X_train, y_train)
+        self.regression_models['XGBoost'] = xgb_reg
+
+        # 2. Random Forest Regressor
+        from sklearn.ensemble import RandomForestRegressor
+        st.write("Training RandomForest Regressor...")
+        rf_reg = RandomForestRegressor(
+            n_estimators=300,
+            max_depth=None,
+            random_state=42,
+            n_jobs=-1
+        )
+        rf_reg.fit(X_train, y_train)
+        self.regression_models['RandomForest'] = rf_reg
+
+        # 3. LightGBM (if available)
+        if LIGHTGBM_AVAILABLE:
+            st.write("Training LightGBM Regressor...")
+            lgb_reg = lgb.LGBMRegressor(
+                num_leaves=31,
+                learning_rate=0.05,
+                n_estimators=300,
+                random_state=42,
+                verbose=-1
+            )
+            lgb_reg.fit(X_train, y_train)
+            self.regression_models['LightGBM'] = lgb_reg
+
+        # Evaluate all models
+        st.write("\nEvaluating regression models...")
+        best_mae = float('inf')
+
+        for name, model in self.regression_models.items():
+            y_pred = model.predict(X_test)
+
+            mae = mean_absolute_error(y_test, y_pred)
+            rmse = np.sqrt(np.mean((y_test - y_pred) ** 2))
+
+            self.regression_metrics[name] = {
+                'mae': mae,
+                'rmse': rmse
+            }
+
+            if mae < best_mae:
+                best_mae = mae
+                self.best_regressor_name = name
+                self.best_regressor = model
+
+    def get_classification_metrics_summary(self) -> pd.DataFrame:
+        """Return classification metrics summary as dataframe"""
         metrics_data = []
-        for name, metrics in self.metrics.items():
+        for name, metrics in self.classification_metrics.items():
             metrics_data.append({
                 'Model': name,
                 'Accuracy': f"{metrics['accuracy']:.4f}",
@@ -409,35 +560,50 @@ class ModelTrainer:
             })
         return pd.DataFrame(metrics_data)
 
+    def get_regression_metrics_summary(self) -> pd.DataFrame:
+        """Return regression metrics summary as dataframe"""
+        metrics_data = []
+        for name, metrics in self.regression_metrics.items():
+            metrics_data.append({
+                'Model': name,
+                'MAE (days)': f"{metrics['mae']:.2f}",
+                'RMSE (days)': f"{metrics['rmse']:.2f}"
+            })
+        return pd.DataFrame(metrics_data)
+
     def save_model(self, filepath: str):
-        """Save best model and feature columns"""
+        """Save both models and feature columns"""
         with open(filepath, 'wb') as f:
             pickle.dump({
-                'model': self.best_model,
-                'model_name': self.best_model_name,
+                'classifier': self.best_classifier,
+                'classifier_name': self.best_classifier_name,
+                'regressor': self.best_regressor,
+                'regressor_name': self.best_regressor_name,
                 'feature_columns': self.feature_columns,
                 'feature_importance': self.feature_importance
             }, f)
 
     @staticmethod
     def load_model(filepath: str):
-        """Load saved model"""
+        """Load saved models"""
         with open(filepath, 'rb') as f:
             data = pickle.load(f)
         trainer = ModelTrainer()
-        trainer.best_model = data['model']
-        trainer.best_model_name = data['model_name']
+        trainer.best_classifier = data['classifier']
+        trainer.best_classifier_name = data['classifier_name']
+        trainer.best_regressor = data.get('regressor')
+        trainer.best_regressor_name = data.get('regressor_name')
         trainer.feature_columns = data['feature_columns']
         trainer.feature_importance = data['feature_importance']
         return trainer
 
 
 # ====================================================
-# 5. UC CONDITION DISCOVERY MODULE
+# 6. UC CONDITION DISCOVERY MODULE
 # ====================================================
 
 class UCConditionDiscovery:
-    """Discovers and summarizes UC rally conditions"""
+    """Discovers and summarizes UC conditions"""
 
     @staticmethod
     def get_top_features(feature_importance: pd.DataFrame, top_n: int = 20) -> pd.DataFrame:
@@ -480,26 +646,52 @@ class UCConditionDiscovery:
         summary += "\n**Key Insights:**\n"
         summary += "- UC rallies typically follow strong momentum in recent days\n"
         summary += "- Volume spikes are a critical indicator\n"
-        summary += "- Stocks above key moving averages are more likely to rally\n"
+        summary += "- Stocks close to highs are more likely to hit UC\n"
         summary += "- Price compression often precedes breakouts\n"
 
         return summary
 
+    @staticmethod
+    def analyze_uc_to_lc_patterns(df: pd.DataFrame) -> Dict:
+        """Analyze historical UC to LC patterns"""
+        uc_data = df[df['is_uc'] == 1].copy()
+
+        if uc_data.empty:
+            return {
+                'total_uc_events': 0,
+                'uc_with_lc': 0,
+                'avg_days_to_lc': 0,
+                'median_days_to_lc': 0,
+                'min_days_to_lc': 0,
+                'max_days_to_lc': 0
+            }
+
+        uc_with_lc = uc_data[uc_data['days_to_lc'].notna()]
+
+        return {
+            'total_uc_events': len(uc_data),
+            'uc_with_lc': len(uc_with_lc),
+            'avg_days_to_lc': uc_with_lc['days_to_lc'].mean() if not uc_with_lc.empty else 0,
+            'median_days_to_lc': uc_with_lc['days_to_lc'].median() if not uc_with_lc.empty else 0,
+            'min_days_to_lc': uc_with_lc['days_to_lc'].min() if not uc_with_lc.empty else 0,
+            'max_days_to_lc': uc_with_lc['days_to_lc'].max() if not uc_with_lc.empty else 0
+        }
+
 
 # ====================================================
-# 6. PREDICTION MODULE
+# 7. PREDICTION MODULE
 # ====================================================
 
 class Predictor:
-    """Predicts UC rally probability for any stock"""
+    """Predicts UC probability and UC to LC duration for any stock"""
 
     def __init__(self, trainer: ModelTrainer):
         self.trainer = trainer
 
-    def predict_uc_rally(self, symbol: str, exchange: str = 'NSE') -> Dict:
+    def predict_uc(self, symbol: str, exchange: str = 'NSE') -> Dict:
         """
-        Predict UC rally probability for a symbol
-        Returns: probability, trigger_price, volume_threshold, reasoning
+        Predict UC probability for a symbol
+        Returns: probability, current status, trigger levels, reasoning
         """
         # Add exchange suffix
         if exchange == 'NSE':
@@ -507,21 +699,25 @@ class Predictor:
         else:
             symbol_yf = f"{symbol}.BO" if not symbol.endswith('.BO') else symbol
 
-        # Fetch last 60 days of data
+        # Fetch last 90 days of data (buffer for feature calculation)
         end_date = datetime.now()
-        start_date = end_date - timedelta(days=90)  # Extra buffer
+        start_date = end_date - timedelta(days=90)
 
         try:
             ticker = yf.Ticker(symbol_yf)
             df = ticker.history(start=start_date, end=end_date)
 
-            if df.empty or len(df) < 60:
-                return {'error': 'Insufficient data for prediction'}
+            if df.empty or len(df) < 15:
+                return {'error': 'Insufficient data (minimum 15 days required)'}
 
             # Prepare data
             df = df.reset_index()
             df['Symbol'] = symbol_yf
             df = df[['Symbol', 'Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
+
+            # Detect circuits
+            circuit_detector = CircuitDetector()
+            df = circuit_detector.detect_circuits(df)
 
             # Compute features
             feature_eng = FeatureEngineer()
@@ -533,11 +729,20 @@ class Predictor:
                 return {'error': 'Could not compute features'}
 
             latest_features = df_latest.iloc[-1:]
+            latest_row = df.iloc[-1]
 
-            # Predict
-            probability = self.trainer.best_model.predict_proba(latest_features)[0, 1]
+            # Predict UC probability
+            uc_probability = self.trainer.best_classifier.predict_proba(latest_features)[0, 1]
 
-            # Calculate trigger price (1% above 5-day high)
+            # Check if currently at UC
+            current_uc_status = "AT UPPER CIRCUIT ✓" if latest_row['is_uc'] == 1 else "Not at UC"
+
+            # If at UC, predict days to LC
+            days_to_lc_pred = None
+            if latest_row['is_uc'] == 1 and self.trainer.best_regressor:
+                days_to_lc_pred = self.trainer.best_regressor.predict(latest_features)[0]
+
+            # Calculate trigger price (5-day high + 1%)
             high_5d = df['High'].tail(5).max()
             trigger_price = high_5d * 1.01
 
@@ -555,18 +760,22 @@ class Predictor:
 
             return {
                 'symbol': symbol_yf,
-                'probability': probability,
+                'uc_probability': uc_probability,
+                'current_uc_status': current_uc_status,
+                'is_currently_uc': int(latest_row['is_uc']),
+                'days_to_lc_prediction': days_to_lc_pred,
                 'trigger_price': trigger_price,
                 'volume_threshold': volume_threshold,
                 'reasoning': reasoning,
-                'current_price': df['Close'].iloc[-1]
+                'current_price': latest_row['Close'],
+                'close_gain_pct': latest_row.get('close_gain_pct', 0)
             }
 
         except Exception as e:
             return {'error': str(e)}
 
     def bulk_screen(self, symbols: List[str]) -> pd.DataFrame:
-        """Screen multiple symbols and return ranked by probability"""
+        """Screen multiple symbols and return ranked by UC probability"""
         results = []
 
         progress_bar = st.progress(0)
@@ -577,19 +786,21 @@ class Predictor:
 
             # Determine exchange from symbol
             exchange = 'NSE' if symbol.endswith('.NS') else 'BSE'
-            pred = self.predict_uc_rally(symbol, exchange)
+            pred = self.predict_uc(symbol, exchange)
 
             if 'error' not in pred:
                 results.append({
                     'Symbol': pred['symbol'],
-                    'UC_Probability': f"{pred['probability']:.4f}",
+                    'UC_Probability': f"{pred['uc_probability']:.4f}",
+                    'Current_Status': pred['current_uc_status'],
                     'Current_Price': f"{pred['current_price']:.2f}",
+                    'Gain_Today_%': f"{pred['close_gain_pct']:.2f}",
                     'Trigger_Price': f"{pred['trigger_price']:.2f}",
                     'Volume_Threshold': f"{pred['volume_threshold']:.0f}"
                 })
 
             progress_bar.progress((idx + 1) / len(symbols))
-            time.sleep(0.1)  # Avoid rate limiting
+            time.sleep(0.1)
 
         progress_bar.empty()
         status_text.empty()
@@ -603,19 +814,19 @@ class Predictor:
 
 
 # ====================================================
-# 7. STREAMLIT GUI
+# 8. STREAMLIT GUI
 # ====================================================
 
 def main():
     st.set_page_config(page_title="UC Rally Detector", layout="wide")
 
     st.title("🚀 Upper-Circuit Rally Detection System")
-    st.markdown("**Complete ML System for NSE/BSE Stocks**")
+    st.markdown("**Strategy: Buy stocks at UC, Hold until LC**")
 
     # Sidebar for navigation
     page = st.sidebar.selectbox(
         "Select Page",
-        ["Data Fetch & Training", "Predict for Any Stock", "Bulk Screener"]
+        ["Data Fetch & Training", "Predict UC for Any Stock", "Bulk UC Screener", "UC to LC Analyzer"]
     )
 
     # Initialize session state
@@ -634,19 +845,25 @@ def main():
     if page == "Data Fetch & Training":
         st.header("📊 Data Collection & Model Training")
 
-        # UC percent override
-        st.subheader("Upper Circuit Settings")
-        col1, col2 = st.columns(2)
+        # Circuit detection settings
+        st.subheader("Circuit Detection Settings")
+        col1, col2, col3 = st.columns(3)
         with col1:
-            uc_percent_nse = st.number_input("NSE UC %", value=10.0, min_value=1.0, max_value=20.0)
+            uc_min_gain = st.number_input("Min UC Gain %", value=2.0, min_value=0.5, max_value=20.0, step=0.5)
         with col2:
-            uc_percent_bse = st.number_input("BSE UC %", value=5.0, min_value=1.0, max_value=20.0)
+            lc_min_loss = st.number_input("Min LC Loss %", value=2.0, min_value=0.5, max_value=20.0, step=0.5)
+        with col3:
+            price_tolerance = st.number_input("Price Tolerance %", value=0.5, min_value=0.1, max_value=2.0, step=0.1)
+
+        st.info(f"📌 UC Detection: Close within {price_tolerance}% of High AND gain >= {uc_min_gain}%")
+        st.info(f"📌 LC Detection: Close within {price_tolerance}% of Low AND loss >= {lc_min_loss}%")
+        st.info(f"📌 Data Range: Maximum 3 years, Minimum 15 days")
 
         st.markdown("---")
 
         # Data fetching
         st.subheader("Step 1: Fetch Historical Data")
-        if st.button("🔄 Fetch all NSE/BSE data (3 years)", type="primary"):
+        if st.button("🔄 Fetch all NSE/BSE data", type="primary"):
             with st.spinner("Fetching data for all NSE and BSE stocks..."):
                 collector = DataCollector()
 
@@ -657,17 +874,22 @@ def main():
 
                 st.info(f"Fetching data for {len(all_symbols)} stocks ({len(nse_symbols)} NSE + {len(bse_symbols)} BSE)...")
 
-                # Fetch data
-                stock_data = collector.fetch_historical_data(all_symbols, years=3)
+                # Fetch data (max 3 years, min 15 days)
+                stock_data = collector.fetch_historical_data(all_symbols, max_years=3, min_days=15)
 
                 if not stock_data.empty:
                     st.success(f"✅ Successfully fetched data for {stock_data['Symbol'].nunique()} stocks!")
                     st.write(f"Total records: {len(stock_data):,}")
 
+                    # Detect circuits
+                    st.info("Detecting UC and LC days...")
+                    circuit_detector = CircuitDetector()
+                    stock_data = circuit_detector.detect_circuits(stock_data, uc_min_gain, lc_min_loss, price_tolerance)
+
                     # Generate labels
-                    st.info("Generating UC rally labels...")
+                    st.info("Generating prediction labels...")
                     label_gen = LabelGenerator()
-                    stock_data = label_gen.generate_labels(stock_data, uc_percent_nse, uc_percent_bse)
+                    stock_data = label_gen.generate_uc_prediction_labels(stock_data)
 
                     # Compute features
                     st.info("Computing features...")
@@ -678,6 +900,13 @@ def main():
                     st.session_state.data_loaded = True
 
                     st.success("✅ Data preparation complete!")
+
+                    # Show statistics
+                    total_uc = stock_data['is_uc'].sum()
+                    total_lc = stock_data['is_lc'].sum()
+                    st.write(f"**UC Days detected:** {total_uc:,}")
+                    st.write(f"**LC Days detected:** {total_lc:,}")
+
                     st.dataframe(stock_data.head(10))
                 else:
                     st.error("Failed to fetch data. Please try again.")
@@ -685,24 +914,34 @@ def main():
         st.markdown("---")
 
         # Model training
-        st.subheader("Step 2: Train UC Rally Model")
-        if st.button("🤖 Train UC Rally Model", type="primary", disabled=not st.session_state.data_loaded):
+        st.subheader("Step 2: Train UC Prediction Models")
+        if st.button("🤖 Train Models", type="primary", disabled=not st.session_state.data_loaded):
             if st.session_state.stock_data is None:
                 st.error("Please fetch data first!")
             else:
                 with st.spinner("Training models..."):
                     trainer = ModelTrainer()
 
-                    # Prepare data
-                    st.info("Preparing training data...")
-                    X_train, X_test, y_train, y_test = trainer.prepare_data(st.session_state.stock_data)
+                    # Train classification model (predict UC tomorrow)
+                    st.info("Training UC Tomorrow Prediction (Classification)...")
+                    X_train, X_test, y_train, y_test = trainer.prepare_classification_data(st.session_state.stock_data)
 
                     st.write(f"Training samples: {len(X_train):,}")
                     st.write(f"Test samples: {len(X_test):,}")
-                    st.write(f"UC Rally cases: {y_train.sum():,} ({y_train.sum()/len(y_train)*100:.2f}%)")
+                    st.write(f"UC cases: {y_train.sum():,} ({y_train.sum()/len(y_train)*100:.2f}%)")
 
-                    # Train models
-                    trainer.train_models(X_train, X_test, y_train, y_test)
+                    trainer.train_classification_models(X_train, X_test, y_train, y_test)
+
+                    # Train regression model (predict days to LC)
+                    st.info("Training UC to LC Days Prediction (Regression)...")
+                    reg_data = trainer.prepare_regression_data(st.session_state.stock_data)
+
+                    if reg_data[0] is not None:
+                        X_train_reg, X_test_reg, y_train_reg, y_test_reg = reg_data
+                        st.write(f"UC→LC Training samples: {len(X_train_reg):,}")
+                        trainer.train_regression_models(X_train_reg, X_test_reg, y_train_reg, y_test_reg)
+                    else:
+                        st.warning("⚠️ Insufficient UC→LC data for regression model")
 
                     st.session_state.trainer = trainer
                     st.session_state.model_trained = True
@@ -710,7 +949,10 @@ def main():
                     # Save model
                     trainer.save_model('uc_rally_model.pkl')
 
-                    st.success(f"✅ Training complete! Best model: {trainer.best_model_name}")
+                    st.success(f"✅ Training complete!")
+                    st.success(f"Best Classifier: {trainer.best_classifier_name}")
+                    if trainer.best_regressor_name:
+                        st.success(f"Best Regressor: {trainer.best_regressor_name}")
 
         # Display metrics
         if st.session_state.model_trained and st.session_state.trainer:
@@ -719,20 +961,27 @@ def main():
 
             trainer = st.session_state.trainer
 
-            # Metrics table
-            st.write("**Model Comparison:**")
-            metrics_df = trainer.get_metrics_summary()
+            # Classification metrics
+            st.write("**UC Tomorrow Prediction (Classification):**")
+            metrics_df = trainer.get_classification_metrics_summary()
             st.dataframe(metrics_df)
 
             # Best model confusion matrix
-            st.write(f"**Confusion Matrix ({trainer.best_model_name}):**")
-            cm = trainer.metrics[trainer.best_model_name]['confusion_matrix']
-            cm_df = pd.DataFrame(
-                cm,
-                index=['Actual: No Rally', 'Actual: Rally'],
-                columns=['Pred: No Rally', 'Pred: Rally']
-            )
-            st.dataframe(cm_df)
+            if trainer.best_classifier_name in trainer.classification_metrics:
+                st.write(f"**Confusion Matrix ({trainer.best_classifier_name}):**")
+                cm = trainer.classification_metrics[trainer.best_classifier_name]['confusion_matrix']
+                cm_df = pd.DataFrame(
+                    cm,
+                    index=['Actual: No UC', 'Actual: UC'],
+                    columns=['Pred: No UC', 'Pred: UC']
+                )
+                st.dataframe(cm_df)
+
+            # Regression metrics
+            if trainer.regression_metrics:
+                st.write("**UC to LC Days Prediction (Regression):**")
+                reg_metrics_df = trainer.get_regression_metrics_summary()
+                st.dataframe(reg_metrics_df)
 
             # Feature importance
             st.markdown("---")
@@ -742,15 +991,36 @@ def main():
 
             # UC Conditions Summary
             st.markdown("---")
-            st.subheader("💡 Discovered UC Rally Conditions")
+            st.subheader("💡 Discovered UC Conditions")
             summary = UCConditionDiscovery.generate_summary(trainer.feature_importance)
             st.markdown(summary)
 
+            # UC to LC Analysis
+            st.markdown("---")
+            st.subheader("📊 Historical UC to LC Patterns")
+            patterns = UCConditionDiscovery.analyze_uc_to_lc_patterns(st.session_state.stock_data)
+
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Total UC Events", f"{patterns['total_uc_events']:,}")
+            with col2:
+                st.metric("UC→LC Events", f"{patterns['uc_with_lc']:,}")
+            with col3:
+                st.metric("Avg Days to LC", f"{patterns['avg_days_to_lc']:.1f}")
+
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Median Days to LC", f"{patterns['median_days_to_lc']:.1f}")
+            with col2:
+                st.metric("Min Days to LC", f"{patterns['min_days_to_lc']:.0f}")
+            with col3:
+                st.metric("Max Days to LC", f"{patterns['max_days_to_lc']:.0f}")
+
     # ====================================================
-    # PAGE 2: PREDICT FOR ANY STOCK
+    # PAGE 2: PREDICT UC FOR ANY STOCK
     # ====================================================
-    elif page == "Predict for Any Stock":
-        st.header("🔮 Predict UC Rally for Individual Stock")
+    elif page == "Predict UC for Any Stock":
+        st.header("🔮 Predict UC for Individual Stock")
 
         # Load model if exists
         if not st.session_state.model_trained:
@@ -767,28 +1037,41 @@ def main():
         with col2:
             exchange = st.selectbox("Select Exchange", ["NSE", "BSE"])
 
-        if st.button("🎯 Predict UC Rally Probability", type="primary"):
+        if st.button("🎯 Predict UC Probability", type="primary"):
             predictor = Predictor(st.session_state.trainer)
 
             with st.spinner(f"Analyzing {symbol_input}..."):
-                result = predictor.predict_uc_rally(symbol_input, exchange)
+                result = predictor.predict_uc(symbol_input, exchange)
 
             if 'error' in result:
                 st.error(f"Error: {result['error']}")
             else:
                 st.success("✅ Prediction Complete!")
 
+                # Current status
+                if result['is_currently_uc'] == 1:
+                    st.success(f"🔥 **{result['symbol']}** is currently AT UPPER CIRCUIT!")
+
+                    if result['days_to_lc_prediction']:
+                        st.info(f"📅 Predicted days to Lower Circuit: **{result['days_to_lc_prediction']:.1f} days**")
+                else:
+                    st.info(f"📊 **{result['symbol']}** is not currently at UC")
+
                 # Display results
                 col1, col2, col3 = st.columns(3)
 
                 with col1:
-                    st.metric("UC Rally Probability", f"{result['probability']*100:.2f}%")
+                    st.metric("UC Tomorrow Probability", f"{result['uc_probability']*100:.2f}%")
                 with col2:
                     st.metric("Current Price", f"₹{result['current_price']:.2f}")
                 with col3:
-                    st.metric("Trigger Price", f"₹{result['trigger_price']:.2f}")
+                    st.metric("Today's Gain", f"{result['close_gain_pct']:.2f}%")
 
-                st.metric("Volume Threshold", f"{result['volume_threshold']:,.0f}")
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("Trigger Price", f"₹{result['trigger_price']:.2f}")
+                with col2:
+                    st.metric("Volume Threshold", f"{result['volume_threshold']:,.0f}")
 
                 # Reasoning
                 st.markdown("---")
@@ -799,18 +1082,21 @@ def main():
                 # Interpretation
                 st.markdown("---")
                 st.subheader("📊 Interpretation")
-                if result['probability'] > 0.7:
-                    st.success("🟢 **HIGH PROBABILITY** - Strong UC rally signals detected!")
-                elif result['probability'] > 0.4:
-                    st.warning("🟡 **MODERATE PROBABILITY** - Some UC rally signals present.")
+                if result['uc_probability'] > 0.7:
+                    st.success("🟢 **HIGH PROBABILITY** - Strong UC signals detected!")
+                    st.write("**Action**: Monitor for entry. Consider buying if volume crosses threshold.")
+                elif result['uc_probability'] > 0.4:
+                    st.warning("🟡 **MODERATE PROBABILITY** - Some UC signals present.")
+                    st.write("**Action**: Watch closely. Wait for confirmation.")
                 else:
-                    st.info("🔵 **LOW PROBABILITY** - Weak UC rally signals.")
+                    st.info("🔵 **LOW PROBABILITY** - Weak UC signals.")
+                    st.write("**Action**: Not recommended for UC strategy.")
 
     # ====================================================
-    # PAGE 3: BULK SCREENER
+    # PAGE 3: BULK UC SCREENER
     # ====================================================
-    elif page == "Bulk Screener":
-        st.header("📋 Bulk Stock Screener")
+    elif page == "Bulk UC Screener":
+        st.header("📋 Bulk Stock Screener - UC Candidates")
 
         # Load model if exists
         if not st.session_state.model_trained:
@@ -841,7 +1127,11 @@ def main():
             if not results_df.empty:
                 st.success(f"✅ Screening complete! Found {len(results_df)} stocks with predictions.")
 
-                st.subheader("🏆 Top UC Rally Candidates (Ranked by Probability)")
+                st.subheader("🏆 Top UC Candidates (Ranked by Probability)")
+
+                # Highlight stocks currently at UC
+                st.info("🔥 Stocks marked with 'AT UPPER CIRCUIT ✓' are currently at UC!")
+
                 st.dataframe(results_df, use_container_width=True, height=600)
 
                 # Download option
@@ -849,11 +1139,74 @@ def main():
                 st.download_button(
                     label="📥 Download Results as CSV",
                     data=csv,
-                    file_name=f"uc_rally_screener_{datetime.now().strftime('%Y%m%d')}.csv",
+                    file_name=f"uc_screener_{datetime.now().strftime('%Y%m%d')}.csv",
                     mime="text/csv"
                 )
             else:
                 st.warning("No results found.")
+
+    # ====================================================
+    # PAGE 4: UC TO LC ANALYZER
+    # ====================================================
+    elif page == "UC to LC Analyzer":
+        st.header("📊 UC to LC Pattern Analyzer")
+
+        if not st.session_state.data_loaded or st.session_state.stock_data is None:
+            st.warning("⚠️ No data loaded. Please fetch data first in 'Data Fetch & Training' page.")
+            st.stop()
+
+        st.info("Analyzing historical UC to LC patterns from loaded data...")
+
+        data = st.session_state.stock_data
+
+        # Filter UC days
+        uc_days = data[data['is_uc'] == 1].copy()
+
+        if uc_days.empty:
+            st.warning("No UC days found in the data.")
+            st.stop()
+
+        st.write(f"**Total UC Days Found:** {len(uc_days):,}")
+
+        # UC with LC data
+        uc_with_lc = uc_days[uc_days['days_to_lc'].notna()]
+        st.write(f"**UC Days with subsequent LC:** {len(uc_with_lc):,}")
+
+        if not uc_with_lc.empty:
+            # Distribution of days to LC
+            st.subheader("📈 Distribution of Days from UC to LC")
+
+            import matplotlib.pyplot as plt
+
+            fig, ax = plt.subplots(figsize=(10, 6))
+            ax.hist(uc_with_lc['days_to_lc'], bins=30, edgecolor='black', alpha=0.7)
+            ax.set_xlabel('Days from UC to LC')
+            ax.set_ylabel('Frequency')
+            ax.set_title('Distribution of Holding Period (UC to LC)')
+            ax.grid(True, alpha=0.3)
+            st.pyplot(fig)
+
+            # Statistics by symbol
+            st.subheader("📊 UC to LC Statistics by Stock")
+
+            symbol_stats = uc_with_lc.groupby('Symbol')['days_to_lc'].agg([
+                ('Count', 'count'),
+                ('Avg_Days', 'mean'),
+                ('Median_Days', 'median'),
+                ('Min_Days', 'min'),
+                ('Max_Days', 'max')
+            ]).round(2).sort_values('Count', ascending=False).reset_index()
+
+            st.dataframe(symbol_stats.head(20), use_container_width=True)
+
+            # Download option
+            csv = symbol_stats.to_csv(index=False)
+            st.download_button(
+                label="📥 Download Full Statistics as CSV",
+                data=csv,
+                file_name=f"uc_to_lc_stats_{datetime.now().strftime('%Y%m%d')}.csv",
+                mime="text/csv"
+            )
 
 
 if __name__ == "__main__":
